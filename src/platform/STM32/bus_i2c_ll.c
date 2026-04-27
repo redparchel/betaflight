@@ -84,7 +84,13 @@ static void i2cEVIRQHandler(i2cDevice_e device)
 
     // Transmit data register empty
     if (LL_I2C_IsEnabledIT_TX(I2Cx) && LL_I2C_IsActiveFlag_TXIS(I2Cx)) {
-        if (state->writing && state->bytes > 0) {
+        // Send the register address byte first (if any), then data bytes.
+        // state->reg is set to 0xFF (the "no register" sentinel) once it has
+        // been sent so subsequent TXIS interrupts fall through to data bytes.
+        if (state->reg != 0xFF) {
+            LL_I2C_TransmitData8(I2Cx, state->reg);
+            state->reg = 0xFF;
+        } else if (state->writing && state->bytes > 0) {
             LL_I2C_TransmitData8(I2Cx, *state->write_p++);
             state->bytes--;
         }
@@ -346,28 +352,14 @@ bool i2cWriteBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len
                               len_, LL_I2C_MODE_AUTOEND,
                               LL_I2C_GENERATE_START_WRITE);
     } else {
-        // Send register address + data bytes
-        // First byte is register address, transmitted in ISR before data
+        // Send register address + data bytes. The ISR transmits the register
+        // address byte (using state->reg) then continues with data bytes.
         LL_I2C_HandleTransfer(I2Cx, state->addr, LL_I2C_ADDRSLAVE_7BIT,
                               1 + len_, LL_I2C_MODE_AUTOEND,
                               LL_I2C_GENERATE_START_WRITE);
-
-        // Wait for TXIS to send the register address byte synchronously
-        // so the ISR only deals with data bytes
-        timeUs_t timeoutStartUs = microsISR();
-        while (!LL_I2C_IsActiveFlag_TXIS(I2Cx)) {
-            if (LL_I2C_IsActiveFlag_NACK(I2Cx)) {
-                LL_I2C_ClearFlag_NACK(I2Cx);
-                return i2cHandleHardwareFailure(device);
-            }
-            if (cmpTimeUs(microsISR(), timeoutStartUs) >= I2C_TIMEOUT_US) {
-                return i2cHandleHardwareFailure(device);
-            }
-        }
-        LL_I2C_TransmitData8(I2Cx, reg_);
     }
 
-    // Enable interrupts to handle remaining data bytes
+    // Enable interrupts to handle data transmission
     LL_I2C_EnableIT_TX(I2Cx);
     LL_I2C_EnableIT_NACK(I2Cx);
     LL_I2C_EnableIT_STOP(I2Cx);
@@ -511,25 +503,15 @@ bool i2cReadBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len,
         // Enable RX interrupts
         LL_I2C_EnableIT_RX(I2Cx);
     } else {
-        // First send register address with SOFTEND, TC interrupt will trigger restart
+        // First send register address with SOFTEND, TC interrupt will trigger restart.
+        // The ISR transmits the register address byte (using state->reg) when TXIS fires.
         LL_I2C_HandleTransfer(I2Cx, state->addr, LL_I2C_ADDRSLAVE_7BIT,
                               1, LL_I2C_MODE_SOFTEND,
                               LL_I2C_GENERATE_START_WRITE);
 
-        // Wait for TXIS to send the register address byte synchronously
-        timeUs_t timeoutStartUs = microsISR();
-        while (!LL_I2C_IsActiveFlag_TXIS(I2Cx)) {
-            if (LL_I2C_IsActiveFlag_NACK(I2Cx)) {
-                LL_I2C_ClearFlag_NACK(I2Cx);
-                return i2cHandleHardwareFailure(device);
-            }
-            if (cmpTimeUs(microsISR(), timeoutStartUs) >= I2C_TIMEOUT_US) {
-                return i2cHandleHardwareFailure(device);
-            }
-        }
-        LL_I2C_TransmitData8(I2Cx, reg_);
-
-        // Enable TC interrupt - ISR will handle the restart and switch to RX
+        // Enable TX interrupt to send the register byte from the ISR; TC will
+        // then fire so the ISR can restart and switch to the read phase.
+        LL_I2C_EnableIT_TX(I2Cx);
         LL_I2C_EnableIT_TC(I2Cx);
     }
 
