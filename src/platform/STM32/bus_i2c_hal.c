@@ -126,6 +126,43 @@ bool i2cWrite(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t data)
 }
 
 // Non-blocking write
+//
+// HAL_I2C_Mem_Write_IT calls I2C_RequestMemoryWrite, which spins on TXIS and
+// TCR with a 25ms HAL timeout (I2C_TIMEOUT_FLAG) before enabling interrupts.
+// On a slow-to-ACK slave (e.g. BMP280 on a shared I2C bus during boot) this
+// 25ms foreground stall blocks the calling task — most visibly the BARO task,
+// which prevents the CALIBRATING arming-disable flag from clearing.
+//
+// Replace the Mem_Write_IT path with chained Master_Seq_Transmit_IT calls.
+// The Seq variants are truly non-blocking (no synchronous TXIS/TCR polling);
+// the register-address byte is sent as the first frame, and the data bytes
+// are sent from HAL_I2C_MasterTxCpltCallback once that frame completes.
+typedef enum {
+    I2C_TXN_IDLE = 0,
+    I2C_TXN_REG_THEN_TX,    // After reg byte sent, continue with data write
+    I2C_TXN_REG_THEN_RX,    // After reg byte sent, restart and read data
+} i2cTxnPhase_t;
+
+typedef struct {
+    volatile i2cTxnPhase_t phase;
+    uint8_t  devAddr;       // pre-shifted slave address
+    volatile uint8_t reg;   // register byte storage (HAL needs a pointer)
+    uint8_t *dataPtr;
+    uint16_t dataLen;
+} i2cTxnState_t;
+
+static i2cTxnState_t i2cTxnState[I2CDEV_COUNT];
+
+static i2cDevice_e i2cDeviceFromHandle(I2C_HandleTypeDef *hi2c)
+{
+    for (i2cDevice_e dev = 0; dev < I2CDEV_COUNT; dev++) {
+        if (&i2cDevice[dev].handle == hi2c) {
+            return dev;
+        }
+    }
+    return I2CINVALID;
+}
+
 bool i2cWriteBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len_, uint8_t *data)
 {
     if (device == I2CINVALID || device >= I2CDEV_COUNT) {
@@ -138,16 +175,38 @@ bool i2cWriteBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len
         return false;
     }
 
+    i2cTxnState_t *st = &i2cTxnState[device];
+
+    if (st->phase != I2C_TXN_IDLE) {
+        return false;
+    }
+
     HAL_StatusTypeDef status;
 
-    status = HAL_I2C_Mem_Write_IT(pHandle ,addr_ << 1, reg_, I2C_MEMADD_SIZE_8BIT,data, len_);
+    if (reg_ == 0xFF) {
+        // No register address; one-shot non-blocking transmit
+        status = HAL_I2C_Master_Transmit_IT(pHandle, addr_ << 1, data, len_);
+    } else {
+        // Send the register byte as the first frame (RELOAD+SOFTEND, no STOP).
+        // The TxCplt callback continues with the data bytes (AUTOEND).
+        st->devAddr = addr_ << 1;
+        st->reg     = reg_;
+        st->dataPtr = data;
+        st->dataLen = len_;
+        st->phase   = I2C_TXN_REG_THEN_TX;
+        status = HAL_I2C_Master_Seq_Transmit_IT(pHandle, st->devAddr,
+                                                (uint8_t *)&st->reg, 1,
+                                                I2C_FIRST_AND_NEXT_FRAME);
+        if (status != HAL_OK) {
+            st->phase = I2C_TXN_IDLE;
+        }
+    }
 
     if (status == HAL_BUSY) {
         return false;
     }
 
-    if (status != HAL_OK)
-    {
+    if (status != HAL_OK) {
         return i2cHandleHardwareFailure(device);
     }
 
@@ -182,6 +241,12 @@ bool i2cRead(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len, uint8
 }
 
 // Non-blocking read
+//
+// Same root-cause as i2cWriteBuffer: HAL_I2C_Mem_Read_IT spins on TXIS/TCR
+// inside I2C_RequestMemoryRead with a 25ms HAL timeout before enabling
+// interrupts. Replace with chained Seq calls: send the register byte as
+// I2C_FIRST_FRAME (SOFTEND, no STOP), then in HAL_I2C_MasterTxCpltCallback
+// issue a Seq_Receive_IT with I2C_LAST_FRAME (restart + AUTOEND).
 bool i2cReadBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len, uint8_t* buf)
 {
     if (device == I2CINVALID || device >= I2CDEV_COUNT) {
@@ -194,9 +259,30 @@ bool i2cReadBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len,
         return false;
     }
 
+    i2cTxnState_t *st = &i2cTxnState[device];
+
+    if (st->phase != I2C_TXN_IDLE) {
+        return false;
+    }
+
     HAL_StatusTypeDef status;
 
-    status = HAL_I2C_Mem_Read_IT(pHandle, addr_ << 1, reg_, I2C_MEMADD_SIZE_8BIT, buf, len);
+    if (reg_ == 0xFF) {
+        // No register address; one-shot non-blocking receive
+        status = HAL_I2C_Master_Receive_IT(pHandle, addr_ << 1, buf, len);
+    } else {
+        st->devAddr = addr_ << 1;
+        st->reg     = reg_;
+        st->dataPtr = buf;
+        st->dataLen = len;
+        st->phase   = I2C_TXN_REG_THEN_RX;
+        status = HAL_I2C_Master_Seq_Transmit_IT(pHandle, st->devAddr,
+                                                (uint8_t *)&st->reg, 1,
+                                                I2C_FIRST_FRAME);
+        if (status != HAL_OK) {
+            st->phase = I2C_TXN_IDLE;
+        }
+    }
 
     if (status == HAL_BUSY) {
         return false;
@@ -207,6 +293,55 @@ bool i2cReadBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len,
     }
 
     return true;
+}
+
+// HAL callback chain: continue or finish a multi-stage Seq transaction.
+// HAL declares these as __weak so this definition overrides the default.
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    i2cDevice_e dev = i2cDeviceFromHandle(hi2c);
+    if (dev == I2CINVALID) {
+        return;
+    }
+    i2cTxnState_t *st = &i2cTxnState[dev];
+    i2cTxnPhase_t phase = st->phase;
+    // Clear phase before issuing the next stage so a recursive callback (final
+    // stage's TxCplt) sees IDLE.
+    st->phase = I2C_TXN_IDLE;
+
+    switch (phase) {
+        case I2C_TXN_REG_THEN_TX:
+            HAL_I2C_Master_Seq_Transmit_IT(hi2c, st->devAddr,
+                                           st->dataPtr, st->dataLen,
+                                           I2C_LAST_FRAME);
+            break;
+        case I2C_TXN_REG_THEN_RX:
+            HAL_I2C_Master_Seq_Receive_IT(hi2c, st->devAddr,
+                                          st->dataPtr, st->dataLen,
+                                          I2C_LAST_FRAME);
+            break;
+        default:
+            break;
+    }
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    i2cDevice_e dev = i2cDeviceFromHandle(hi2c);
+    if (dev == I2CINVALID) {
+        return;
+    }
+    i2cTxnState[dev].phase = I2C_TXN_IDLE;
+    i2cErrorCount++;
+}
+
+void HAL_I2C_AbortCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    i2cDevice_e dev = i2cDeviceFromHandle(hi2c);
+    if (dev == I2CINVALID) {
+        return;
+    }
+    i2cTxnState[dev].phase = I2C_TXN_IDLE;
 }
 
 bool i2cBusy(i2cDevice_e device, bool *error)
