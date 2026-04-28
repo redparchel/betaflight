@@ -60,3 +60,6 @@ eeprom.bin
 # changed to submodule
 #/src/config
 
+# Local custom configs for personal builds (see local-configs/README.md)
+/local-configs/
+
