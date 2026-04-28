@@ -125,7 +125,41 @@ bool i2cWrite(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t data)
     return true;
 }
 
-// Non-blocking write
+// Background: HAL_I2C_Mem_Write_IT / Mem_Read_IT call I2C_RequestMemoryWrite/
+// Read synchronously (polled with I2C_TIMEOUT_FLAG = 25ms in the upstream ST
+// HAL) before enabling interrupts. On a slow-to-ACK slave (e.g. BMP280 on a
+// shared I2C bus) the foreground task stalls up to 25ms inside what's sold as
+// non-blocking — most visibly the BARO task, which then can't clear the
+// CALIBRATING arming-disable flag. Use HAL APIs that are actually
+// interrupt-driven instead (see i2cWriteBuffer / i2cReadBuffer below).
+
+// Per-device buffer for combining reg + data into one non-blocking write.
+// 32 bytes is comfortably above any current caller; i2cWriteBuffer rejects
+// requests that would overflow it.
+#define I2C_WRITE_BUF_LEN 32
+static uint8_t i2cWriteBuf[I2CDEV_COUNT][I2C_WRITE_BUF_LEN];
+
+// Per-device read state for the two-stage register-then-restart-receive flow.
+static struct {
+    uint8_t  devAddr;       // pre-shifted slave address
+    volatile uint8_t reg;   // register byte storage (HAL needs a pointer)
+    uint8_t *buf;
+    uint8_t  len;
+    volatile bool active;
+} i2cReadState[I2CDEV_COUNT];
+
+static i2cDevice_e i2cDeviceFromHandle(I2C_HandleTypeDef *hi2c)
+{
+    for (i2cDevice_e dev = 0; dev < I2CDEV_COUNT; dev++) {
+        if (&i2cDevice[dev].handle == hi2c) {
+            return dev;
+        }
+    }
+    return I2CINVALID;
+}
+
+// Non-blocking write: combine reg + data into one buffer, ship via
+// HAL_I2C_Master_Transmit_IT (no synchronous setup phase, unlike Mem_Write_IT).
 bool i2cWriteBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len_, uint8_t *data)
 {
     if (device == I2CINVALID || device >= I2CDEV_COUNT) {
@@ -140,17 +174,24 @@ bool i2cWriteBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len
 
     HAL_StatusTypeDef status;
 
-    status = HAL_I2C_Mem_Write_IT(pHandle ,addr_ << 1, reg_, I2C_MEMADD_SIZE_8BIT,data, len_);
+    if (reg_ == 0xFF) {
+        status = HAL_I2C_Master_Transmit_IT(pHandle, addr_ << 1, data, len_);
+    } else {
+        if ((uint16_t)len_ + 1 > I2C_WRITE_BUF_LEN) {
+            return false;
+        }
+        uint8_t *buf = i2cWriteBuf[device];
+        buf[0] = reg_;
+        memcpy(&buf[1], data, len_);
+        status = HAL_I2C_Master_Transmit_IT(pHandle, addr_ << 1, buf, 1 + len_);
+    }
 
     if (status == HAL_BUSY) {
         return false;
     }
-
-    if (status != HAL_OK)
-    {
+    if (status != HAL_OK) {
         return i2cHandleHardwareFailure(device);
     }
-
     return true;
 }
 
@@ -181,7 +222,9 @@ bool i2cRead(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len, uint8
     return true;
 }
 
-// Non-blocking read
+// Non-blocking read: send reg byte as a SOFTEND frame, then in the TxCplt
+// callback issue Seq_Receive with AUTOEND (HAL emits the restart+read+STOP).
+// Both calls are interrupt-driven, no synchronous setup.
 bool i2cReadBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len, uint8_t* buf)
 {
     if (device == I2CINVALID || device >= I2CDEV_COUNT) {
@@ -196,17 +239,57 @@ bool i2cReadBuffer(i2cDevice_e device, uint8_t addr_, uint8_t reg_, uint8_t len,
 
     HAL_StatusTypeDef status;
 
-    status = HAL_I2C_Mem_Read_IT(pHandle, addr_ << 1, reg_, I2C_MEMADD_SIZE_8BIT, buf, len);
+    if (reg_ == 0xFF) {
+        status = HAL_I2C_Master_Receive_IT(pHandle, addr_ << 1, buf, len);
+    } else {
+        if (i2cReadState[device].active) {
+            return false;
+        }
+        i2cReadState[device].devAddr = addr_ << 1;
+        i2cReadState[device].reg     = reg_;
+        i2cReadState[device].buf     = buf;
+        i2cReadState[device].len     = len;
+        i2cReadState[device].active  = true;
+        status = HAL_I2C_Master_Seq_Transmit_IT(pHandle, addr_ << 1,
+                                                (uint8_t *)&i2cReadState[device].reg, 1,
+                                                I2C_FIRST_FRAME);
+        if (status != HAL_OK) {
+            i2cReadState[device].active = false;
+        }
+    }
 
     if (status == HAL_BUSY) {
         return false;
     }
-
     if (status != HAL_OK) {
         return i2cHandleHardwareFailure(device);
     }
-
     return true;
+}
+
+// HAL weak callback overrides. TxCplt fires after the reg byte for a chained
+// read (kick off the receive); for a write or the final read frame it's a
+// no-op. ErrorCallback clears in-flight read state on NACK / bus error.
+void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    i2cDevice_e dev = i2cDeviceFromHandle(hi2c);
+    if (dev == I2CINVALID || !i2cReadState[dev].active) {
+        return;
+    }
+    i2cReadState[dev].active = false;
+    HAL_I2C_Master_Seq_Receive_IT(hi2c, i2cReadState[dev].devAddr,
+                                  i2cReadState[dev].buf, i2cReadState[dev].len,
+                                  I2C_LAST_FRAME);
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    i2cDevice_e dev = i2cDeviceFromHandle(hi2c);
+    if (dev == I2CINVALID) {
+        return;
+    }
+    i2cReadState[dev].active = false;
+    i2cErrorCount++;
 }
 
 bool i2cBusy(i2cDevice_e device, bool *error)
